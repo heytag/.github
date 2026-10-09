@@ -1,0 +1,101 @@
+name: Scan for GitHub-hosted Runners
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'  # Every Monday at 7:00 UTC
+  workflow_dispatch:
+
+jobs:
+  scan:
+    name: Scan org workflows
+    runs-on: [self-hosted, heytag-ci]
+    steps:
+      - name: Generate org-wide token
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.ORG_SCANNER_CLIENT_ID }}
+          private-key: ${{ secrets.ORG_SCANNER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Scan all repos for GitHub-hosted runners
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          GH_RUNNER_PATTERN='ubuntu-latest|ubuntu-[0-9]|windows-latest|macos-latest|macos-[0-9]'
+
+          repos=$(gh api "orgs/${ORG}/repos?per_page=100&type=all" \
+            --paginate --jq '.[].name' | sort)
+
+          findings=""
+
+          for repo in $repos; do
+            files=$(gh api "repos/${ORG}/${repo}/contents/.github/workflows" \
+              --jq '.[].name' 2>/dev/null \
+              | grep -E '\.(yml|yaml)$' || true)
+
+            [ -z "$files" ] && continue
+
+            for f in $files; do
+              content=$(gh api \
+                "repos/${ORG}/${repo}/contents/.github/workflows/${f}" \
+                --jq '.content' | base64 -d 2>/dev/null || true)
+
+              [ -z "$content" ] && continue
+
+              # Only flag uncommented runs-on lines
+              matches=$(echo "$content" \
+                | grep -n '^\s*runs-on:' \
+                | grep -vE '^\s*[0-9]+:\s*#' \
+                | grep -E "$GH_RUNNER_PATTERN" || true)
+
+              while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                lineno=$(echo "$line" | cut -d: -f1)
+                val=$(echo "$line" | cut -d: -f2- | sed 's/^\s*runs-on:\s*//' | tr -d '\r')
+                findings="${findings}\n- \`${repo}\` / \`.github/workflows/${f}\` L${lineno}: \`${val}\`"
+              done <<< "$matches"
+            done
+          done
+
+          if [ -z "$findings" ]; then
+            echo "All workflows use self-hosted runners. Closing any open issue."
+            open_issue=$(gh issue list \
+              --repo "${ORG}/.github" \
+              --label "runner-audit" \
+              --state open \
+              --json number \
+              --jq '.[0].number' 2>/dev/null || echo "")
+            if [ -n "$open_issue" ]; then
+              gh issue close "$open_issue" \
+                --repo "${ORG}/.github" \
+                --comment "All GitHub-hosted runner usages have been resolved. Closing automatically."
+            fi
+            exit 0
+          fi
+
+          body="$(printf "## GitHub-hosted runners detected\n\nThe following active (non-commented) \`runs-on:\` lines use a GitHub-hosted runner instead of \`[self-hosted, heytag-ci]\`.\n\nLeft unaddressed, these consume free-tier Actions minutes (2,000 min/month) and will silently fail once the limit is hit.\n\n%b\n\n### Fix\nChange each \`runs-on:\` to:\n\`\`\`yaml\nruns-on: [self-hosted, heytag-ci]\n\`\`\`\n\n_Detected by [scan-runner-types](../actions/workflows/scan-runner-types.yml) — runs every Monday_" "$findings")"
+
+          open_issue=$(gh issue list \
+            --repo "${ORG}/.github" \
+            --label "runner-audit" \
+            --state open \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || echo "")
+
+          if [ -n "$open_issue" ]; then
+            gh issue edit "$open_issue" \
+              --repo "${ORG}/.github" \
+              --body "$body"
+            echo "Updated issue #${open_issue}"
+          else
+            gh issue create \
+              --repo "${ORG}/.github" \
+              --title "Runner audit: GitHub-hosted runners in use" \
+              --body "$body" \
+              --label "runner-audit"
+            echo "Created new issue"
+          fi
